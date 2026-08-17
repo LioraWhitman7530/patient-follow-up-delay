@@ -1,0 +1,20 @@
+{
+  "name": "patient-follow-up-delay",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/follow_up_service.ts",
+    "worker": "tsx src/follow_up_worker.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/follow_up_policy.test.ts"
+  },
+  "dependencies": {
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}
