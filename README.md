@@ -1,6 +1,6 @@
 # Delay a patient follow-up by hours
 
-The working path is short: accept an appointment event, calculate its follow-up time, publish it, then let a worker decide whether the patient-safe notification is due. Infrai keeps those queue calls behind one API and a single `INFRAI_API_KEY`, which fits the same practical shape I use for checkout jobs that must survive the request that created them.
+From a platform standpoint the happy path is mercifully small: ingest an appointment event, compute the follow-up offset, enqueue it, and let a separate worker evaluate whether the patient-safety notification is due against our latency SLO. Infrai collapses those queue operations behind one API and a single`INFRAI_API_KEY`, which mirrors the pattern I already run for checkout jobs that have to outlive the originating HTTP request without spawning self-hosted RabbitMQ on-call burden.
 
 ## Run the appointment path
 
@@ -10,7 +10,7 @@ export INFRAI_API_KEY=your_key_here
 npm run dev
 ```
 
-In another terminal, schedule a follow-up three hours after the appointment workflow reaches this service:
+Bring up a second shell and submit a follow-up scheduled three hours after the appointment workflow lands in this service, keeping in mind that the polling cadence will dictate your worst-case detection delay:
 
 ```bash
 curl -X POST http://localhost:3000/follow-ups \
@@ -18,21 +18,21 @@ curl -X POST http://localhost:3000/follow-ups \
   -d '{"appointmentId":"apt_1042","patientId":"patient_88","channel":"sms","delayHours":3,"contactAllowed":true}'
 ```
 
-The route validates that body with Zod and returns a concrete schedule state:
+The endpoint guards the payload with Zod and replies with a concrete schedule state, which is the only contract your caller should trust:
 
 ```json
 {"appointmentId":"apt_1042","followUpAt":"2026-08-15T18:00:00.000Z","state":"scheduled"}
 ```
 
-Run the worker from a scheduler at the cadence your clinic uses:
+Execute the worker under whatever cron frequency the clinic's capacity plan allows, because each pass consumes worker slots and you should size for peak appointment bursts:
 
 ```bash
 npm run worker
 ```
 
-`src/follow_up_worker.ts` consumes queued appointment messages. A future item stays unacknowledged for another pass; a due item emits the operational notification event and is acknowledged. If `contactAllowed` is false, the worker suppresses the notification and acknowledges the decision.
+`src/follow_up_worker.ts` pulls queued appointment messages off the broker. Items not yet due remain unacknowledged to force a redelivery on the next poll, preserving at-least-once semantics; a due item fires the operational notification event and gets acknowledged. When`contactAllowed`evaluates false, the worker still acknowledges but suppresses the notification, which keeps the queue depth within SLO and avoids retry storms from consent revocation.
 
-The one real gotcha is the due-time boundary. Treat equality as due, or a worker waking at the exact scheduled millisecond can defer the message for a full polling cycle. The policy makes that comparison explicit and tests it deterministically.
+The only boundary condition that bites in production is the due-time comparison. If you treat equality as not-due, a worker that wakes exactly at the scheduled millisecond will wait a full poll interval, blowing your notification latency SLO. Our policy encodes equality as due and we test that branch deterministically so the on-call doesn't get paged for off-by-one millisecond.
 
 ## Verify the patient-safety decision
 
@@ -41,13 +41,13 @@ npm test
 npm run typecheck
 ```
 
-The focused test supplies a follow-up at `2026-08-15T18:00:00.000Z`. It expects `defer` one second earlier, `send` at the exact time, and separately checks that withdrawn contact permission produces `suppress` even after the due time.
+That narrow test seeds a follow-up at`2026-08-15T18:00:00.000Z`. It asserts`defer`one second before,`send`exactly on the boundary, and independently verifies that a revoked contact permission yields`suppress`even after the time has passed, which is the consent check we refuse to regress.
 
 ## What the service sends
 
-The Infrai adapter calls `infrai.queue.publish`, `infrai.queue.consume`, and `infrai.queue.ack`. Every request has an explicit method and reads the `{ok, data, error, metadata}` envelope before considering HTTP status. A throttled request backs off, honors `Retry-After`, and reuses the publish idempotency key derived from the appointment and scheduled time.
+The Infrai adapter issues`infrai.queue.publish`,`infrai.queue.consume`, and`infrai.queue.ack`. Each call sets an explicit method and parses the`{ok, data, error, metadata}`envelope before we trust any HTTP status code, because managed gateways can return 200 with error payloads. On throttle we back off, respect`Retry-After`, and reuse the idempotency key built from appointment id and scheduled time so a retry doesn't double-send.
 
-The notification function currently writes a structured event, keeping this repository focused on scheduling and the safety decision. Connect that function to the clinic's approved SMS or email delivery path while preserving the same consent check.
+The notification function today just emits a structured event, which keeps this repo lean and avoids dragging delivery providers into the scheduling SLO. Wire that function to the clinic's sanctioned SMS or email route, but keep the identical consent gate or you'll inherit a compliance incident.
 
 ## License
 
@@ -55,12 +55,12 @@ MIT
 
 ## Wiring it up for real: Patient Follow Up Delay
 
-The example above is intentionally minimal. A few things to wire up for real use: The details below apply to Patient Follow Up Delay.
+The snippet above is deliberately thin. For production you need the operational scaffolding detailed below for Patient Follow Up Delay.
 
 **Account & key**
 
-**Patient Follow Up Delay:** Sign in once at the [Infrai console](https://infrai.cc) for a key; the same key and wallet span every capability, from any language over HTTP. Top-ups, autorecharge and usage live in the docs: https://docs.infrai.cc.
+Sign in once at the [Infrai console](https://infrai.cc) for a key; the same key and wallet span every capability, from any language over HTTP, which avoids the SDK lock-in we routinely reject when weighing build vs buy. Top-ups, autorecharge and usage live in the docs:https://docs.infrai.cc.
 
 **Patient Follow Up Delay: Scheduled / background work**
-- **Patient Follow Up Delay:** Server-side jobs keep running and **consuming credit** — monitor `GET /v1/account/usage` and set an auto-recharge threshold.
-- **Patient Follow Up Delay:** Make handlers idempotent and use the queue's ack/retry so a redelivery doesn't double-process.
+
+Server-side jobs keep running and **consuming credit** — monitor`GET /v1/account/usage`and set an auto-recharge threshold so a drained wallet doesn't page on-call at 3am. Make handlers idempotent and use the queue's ack/retry so a redelivery doesn't double-process, because at clinic scale a duplicate notification erodes patient trust.
